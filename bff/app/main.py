@@ -290,10 +290,6 @@ def local_agent_response(prompt: str) -> str:
     )
 
 
-def ai_unavailable_response() -> str:
-    return "I'm unable to reach the AI service right now. Please try again in a moment."
-
-
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "service": "ag-ui-bff"}
@@ -390,11 +386,8 @@ async def ag_ui(request: Request) -> StreamingResponse:
             )
 
             # Forward each delta the moment HPE's agent emits it instead of re-chunking a fully buffered answer.
-            received_any = False
-            stream_error = ""
             try:
                 async for delta in stream_hpesc_agent_answer(prompt, channel, context_id):
-                    received_any = True
                     yield send(
                         TextMessageContentEvent(
                             type=EventType.TEXT_MESSAGE_CONTENT,
@@ -402,29 +395,8 @@ async def ag_ui(request: Request) -> StreamingResponse:
                             delta=delta,
                         )
                     )
-            except Exception as ex:
+            except Exception:
                 logger.exception("hpesc_agent_stream_failed")
-                stream_error = str(ex)
-
-            if not received_any:
-                yield send(
-                    CustomEvent(
-                        type=EventType.CUSTOM,
-                        name="AI_ERROR",
-                        value={
-                            "threadId": thread_id,
-                            "runId": run_id,
-                            "reason": stream_error or "HPE Support Center agent returned empty content",
-                        },
-                    )
-                )
-                yield send(
-                    TextMessageContentEvent(
-                        type=EventType.TEXT_MESSAGE_CONTENT,
-                        message_id=message_id,
-                        delta=ai_unavailable_response(),
-                    )
-                )
 
         yield send(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=message_id))
 
