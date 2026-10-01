@@ -59,6 +59,13 @@ async def create_conversation(response: Response) -> Conversation:
     return conversation.model_copy(deep=True)
 
 
+# List all saved conversations, most recently created first, for a sidebar/history view.
+@router.get("", response_model=list[Conversation])
+async def list_conversations(response: Response) -> list[Conversation]:
+    response.headers["Cache-Control"] = "no-store"
+    return [conversation.model_copy(deep=True) for conversation in reversed(conversations.values())]
+
+
 # Return a saved conversation, including its messages and user context.
 @router.get("/{thread_id}", response_model=Conversation)
 async def get_conversation(thread_id: UUID, response: Response) -> Conversation:
@@ -81,5 +88,12 @@ async def update_context(thread_id: UUID, context: dict[str, str], response: Res
 async def close_conversation(thread_id: UUID, response: Response) -> Conversation:
     conversation = find_conversation(thread_id)
     conversation.status = "CLOSED"
+    response.headers["Cache-Control"] = "no-store"
+    return conversation.model_copy(deep=True)
+
+@router.post("/{thread_id}/delete", response_model=Conversation)
+async def delete_conversation(thread_id: UUID, response: Response) -> Conversation:
+    conversation = find_conversation(thread_id)
+    del conversations[thread_id]
     response.headers["Cache-Control"] = "no-store"
     return conversation.model_copy(deep=True)

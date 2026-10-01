@@ -11,6 +11,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from app.conversations import Message, prepare_turn
 from app.conversations import router as conversations_router
 
 from ag_ui.core import (
@@ -254,15 +255,25 @@ async def ag_ui(request: Request) -> StreamingResponse:
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    thread_id = body.get("threadId") or ("thread-" + str(uuid4()))
     run_id = body.get("runId") or ("run-" + str(uuid4()))
     message_id = "msg-" + str(uuid4())
     prompt = extract_user_prompt(body)
     channel = (body.get("channel") or "hpesc_agent").strip()
-    context_id = (body.get("context_id") or thread_id).strip()
 
     if not prompt:
         raise HTTPException(status_code=400, detail="No user prompt found in messages")
+
+    # A stored conversation is optional (older/other clients may not create one first),
+    # but if a threadId is supplied it must resolve to a real, open conversation.
+    conversation = None
+    thread_id_raw = body.get("threadId")
+    if thread_id_raw:
+        conversation, _ = prepare_turn(thread_id_raw, prompt)
+        thread_id = str(conversation.threadId)
+    else:
+        thread_id = "thread-" + str(uuid4())
+
+    context_id = (body.get("context_id") or thread_id).strip()
 
     encoder = EventEncoder()
 
@@ -283,11 +294,14 @@ async def ag_ui(request: Request) -> StreamingResponse:
             final_answer = local_agent_response(prompt)
 
         if route == "ai" and (ai_error or not ai_text.strip()):
+            final_answer = "Unable to get a response from HPE Support Center. Please try again."
             logger.warning("ag_ui_upstream_failed thread_id=%s run_id=%s", thread_id, run_id)
+            if conversation is not None:
+                conversation.messages.append(Message(role="assistant", content=final_answer))
             yield send(
                 RunErrorEvent(
                     type=EventType.RUN_ERROR,
-                    message="Unable to get a response from HPE Support Center. Please try again.",
+                    message=final_answer,
                     code="UPSTREAM_ERROR",
                 )
             )
@@ -318,6 +332,10 @@ async def ag_ui(request: Request) -> StreamingResponse:
                         },
                     )
                 )
+
+        # Persist the assistant's reply now that we know it's actually going out to the client.
+        if conversation is not None:
+            conversation.messages.append(Message(role="assistant", content=final_answer))
 
         yield send(
             TextMessageStartEvent(
