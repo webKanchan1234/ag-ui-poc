@@ -11,10 +11,13 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from app.conversations import Message, prepare_turn
+from app.conversations import router as conversations_router
 
 from ag_ui.core import (
     CustomEvent,
     EventType,
+    RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
     TextMessageContentEvent,
@@ -41,6 +44,7 @@ if load_dotenv:
 HPESC_TLS_VERIFY = os.getenv("HPESC_VERIFY_SSL", "false").strip().lower() in ("1", "true", "yes")
 
 app = FastAPI(title="AG-UI BFF", version="2.0.0")
+app.include_router(conversations_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -188,57 +192,6 @@ async def hpesc_agent_answer(query: str, channel: str, context_id: str) -> tuple
         return "", str(ex)
 
 
-# Forwards assistant text deltas as HPE's agent emits them instead of buffering the full SSE body first.
-async def stream_hpesc_agent_answer(query: str, channel: str, context_id: str):
-    access_token, token_error = await get_hpesc_access_token()
-    if not access_token:
-        logger.error("hpesc_stream_no_token: %s", token_error)
-        return
-
-    agent_url = os.getenv(
-        "HPESC_AGENT_URL",
-        "https://api-gw-ext-dev.support.hpe.com/apigwext/llmaas/hpescagent/v1/graph-stream",
-    ).strip()
-    timeout_seconds = float(os.getenv("HPESC_TIMEOUT_SECONDS", "20"))
-
-    payload = {
-        "query": query,
-        "channel": channel,
-        "context_id": context_id,
-    }
-    headers = {
-        "Authorization": "Bearer " + access_token,
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
-
-    async with httpx.AsyncClient(timeout=timeout_seconds, verify=HPESC_TLS_VERIFY) as client:
-        async with client.stream("POST", agent_url, headers=headers, json=payload) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-
-                data_str = line[len("data:"):].strip()
-                if not data_str:
-                    continue
-
-                try:
-                    event = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                event_type = event.get("type")
-                if event_type == "TEXT_MESSAGE_CONTENT":
-                    delta = event.get("delta", "")
-                    if delta:
-                        yield delta
-                elif event_type == "RUN_FINISHED":
-                    output = (event.get("result") or {}).get("output", "")
-                    if output:
-                        yield str(output)
-
-
 # Detect unresolved/refusal wording in AI output before deciding escalation.
 def ai_cannot_answer(answer: str) -> bool:
     if not answer.strip():
@@ -302,15 +255,25 @@ async def ag_ui(request: Request) -> StreamingResponse:
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    thread_id = body.get("threadId") or ("thread-" + str(uuid4()))
     run_id = body.get("runId") or ("run-" + str(uuid4()))
     message_id = "msg-" + str(uuid4())
     prompt = extract_user_prompt(body)
     channel = (body.get("channel") or "hpesc_agent").strip()
-    context_id = (body.get("context_id") or thread_id).strip()
 
     if not prompt:
         raise HTTPException(status_code=400, detail="No user prompt found in messages")
+
+    # A stored conversation is optional (older/other clients may not create one first),
+    # but if a threadId is supplied it must resolve to a real, open conversation.
+    conversation = None
+    thread_id_raw = body.get("threadId")
+    if thread_id_raw:
+        conversation, _ = prepare_turn(thread_id_raw, prompt)
+        thread_id = str(conversation.threadId)
+    else:
+        thread_id = "thread-" + str(uuid4())
+
+    context_id = (body.get("context_id") or thread_id).strip()
 
     encoder = EventEncoder()
 
@@ -322,14 +285,29 @@ async def ag_ui(request: Request) -> StreamingResponse:
         # loading indicator immediately instead of waiting for the full answer.
         yield send(RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id))
 
-        # Route depends only on the user's wording, so it's known before any upstream call.
-        route = "local-agent" if requests_live_agent(prompt) else "ai"
+        ai_text, ai_error = await hpesc_agent_answer(prompt, channel, context_id)
+
+        route = "ai"
+        final_answer = ai_text
+        if requests_live_agent(prompt):
+            route = "local-agent"
+            final_answer = local_agent_response(prompt)
+
+        if route == "ai" and (ai_error or not ai_text.strip()):
+            final_answer = "Unable to get a response from HPE Support Center. Please try again."
+            logger.warning("ag_ui_upstream_failed thread_id=%s run_id=%s", thread_id, run_id)
+            if conversation is not None:
+                conversation.messages.append(Message(role="assistant", content=final_answer))
+            yield send(
+                RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    message=final_answer,
+                    code="UPSTREAM_ERROR",
+                )
+            )
+            return
 
         if route == "local-agent":
-            final_answer = local_agent_response(prompt)
-            # Still call the agent so a genuine upstream failure surfaces as AI_ERROR alongside the redirect.
-            _, ai_error = await hpesc_agent_answer(prompt, channel, context_id)
-
             yield send(
                 CustomEvent(
                     type=EventType.CUSTOM,
@@ -355,48 +333,31 @@ async def ag_ui(request: Request) -> StreamingResponse:
                     )
                 )
 
+        # Persist the assistant's reply now that we know it's actually going out to the client.
+        if conversation is not None:
+            conversation.messages.append(Message(role="assistant", content=final_answer))
+
+        yield send(
+            TextMessageStartEvent(
+                type=EventType.TEXT_MESSAGE_START,
+                message_id=message_id,
+                role="assistant",
+                name=route,
+            )
+        )
+
+        stream_chunk_size = int(os.getenv("AGUI_STREAM_CHUNK_SIZE", "24"))
+        stream_chunk_delay = float(os.getenv("AGUI_STREAM_CHUNK_DELAY", "0.02"))
+
+        for chunk in chunk_text(final_answer, stream_chunk_size):
             yield send(
-                TextMessageStartEvent(
-                    type=EventType.TEXT_MESSAGE_START,
+                TextMessageContentEvent(
+                    type=EventType.TEXT_MESSAGE_CONTENT,
                     message_id=message_id,
-                    role="assistant",
-                    name=route,
+                    delta=chunk,
                 )
             )
-
-            stream_chunk_size = int(os.getenv("AGUI_STREAM_CHUNK_SIZE", "24"))
-            stream_chunk_delay = float(os.getenv("AGUI_STREAM_CHUNK_DELAY", "0.02"))
-            for chunk in chunk_text(final_answer, stream_chunk_size):
-                yield send(
-                    TextMessageContentEvent(
-                        type=EventType.TEXT_MESSAGE_CONTENT,
-                        message_id=message_id,
-                        delta=chunk,
-                    )
-                )
-                await asyncio.sleep(stream_chunk_delay)
-        else:
-            yield send(
-                TextMessageStartEvent(
-                    type=EventType.TEXT_MESSAGE_START,
-                    message_id=message_id,
-                    role="assistant",
-                    name=route,
-                )
-            )
-
-            # Forward each delta the moment HPE's agent emits it instead of re-chunking a fully buffered answer.
-            try:
-                async for delta in stream_hpesc_agent_answer(prompt, channel, context_id):
-                    yield send(
-                        TextMessageContentEvent(
-                            type=EventType.TEXT_MESSAGE_CONTENT,
-                            message_id=message_id,
-                            delta=delta,
-                        )
-                    )
-            except Exception:
-                logger.exception("hpesc_agent_stream_failed")
+            await asyncio.sleep(stream_chunk_delay)
 
         yield send(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=message_id))
 
