@@ -93,6 +93,7 @@ async def get_hpesc_access_token() -> tuple[str, str]:
     token_url = os.getenv("HPESC_TOKEN_URL", "").strip()
     client_id = os.getenv("HPESC_CLIENT_ID", "").strip()
     client_secret = os.getenv("HPESC_CLIENT_SECRET", "").strip()
+    grant_type = os.getenv("HPESC_GRANT_TYPE", "client_credentials").strip()
     timeout_seconds = float(os.getenv("HPESC_TIMEOUT_SECONDS", "20"))
 
     if not token_url or not client_id or not client_secret:
@@ -101,7 +102,7 @@ async def get_hpesc_access_token() -> tuple[str, str]:
     data = {
         "client_id": client_id,
         "client_secret": client_secret,
-        "grant_type": "client_credentials",
+        "grant_type": grant_type,
     }
 
     try:
@@ -225,12 +226,23 @@ def ai_cannot_answer(answer: str) -> bool:
 def requests_live_agent(prompt: str) -> bool:
     text = (prompt or "").lower().strip()
     direct_patterns = [
-        r"\blive\s*agent\b",
-        r"\bhuman\s*(agent|support)?\b",
+        r"^(live|agent|human|operator|support)[.!?]*$",
+        r"\blive\s*(agent|chat|support|person)\b",
+        r"\bhuman\s*(agent|support|representative|assistance)?\b",
+        r"\breal\s+(person|agent|human)\b",
+        r"\b(actual|another)\s+person\b",
         r"\brepresentative\b",
-        r"\bescalate\b",
-        r"\bconnect me\b.*\b(agent|human)\b",
-        r"\btransfer\b.*\b(agent|human)\b",
+        r"\bescalat(?:e|ion)\b",
+        r"\b(customer|support|service)\s+(agent|representative|executive)\b",
+        r"\b(talk|speak|chat)\s+(to|with)\s+(a\s+|an\s+|someone\s+from\s+)?"
+        r"(person|agent|human|representative|support|customer service)\b",
+        r"\b(talk|speak)\s+(to|with)\s+someone\b",
+        r"\bconnect\s+me\b.*\b(agent|human|person|support|operator)\b",
+        r"\btransfer\b.*\b(agent|human|person|support|operator)\b",
+        r"\b(request|arrange|schedule)\s+(a\s+)?call\s*back\b",
+        r"\bcall\s+me\s+back\b",
+        r"\b(speak|talk)\s+(to|with)\s+(a\s+|the\s+|your\s+)?"
+        r"(supervisor|manager|technician)\b",
     ]
     return any(re.search(pattern, text) for pattern in direct_patterns)
 
@@ -285,13 +297,30 @@ async def ag_ui(request: Request) -> StreamingResponse:
         # loading indicator immediately instead of waiting for the full answer.
         yield send(RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id))
 
-        ai_text, ai_error = await hpesc_agent_answer(prompt, channel, context_id)
-
+        ai_text = ""
+        ai_error = ""
         route = "ai"
-        final_answer = ai_text
-        if requests_live_agent(prompt):
-            route = "local-agent"
-            final_answer = local_agent_response(prompt)
+
+        if conversation is not None and conversation.status != "AI_ACTIVE":
+            route = "handoff"
+            final_answer = (
+                conversation.message
+                or "This conversation is not accepting AI messages."
+            )
+        elif requests_live_agent(prompt):
+            route = "handoff"
+            if conversation is None:
+                final_answer = "Start a saved conversation before requesting a transfer."
+            else:
+                conversation.status = "HANDOFF_PENDING"
+                conversation.interruptId = uuid4()
+                conversation.message = "Connecting to live agent"
+                final_answer = conversation.message
+        else:
+            ai_text, ai_error = await hpesc_agent_answer(
+                prompt, channel, context_id
+            )
+            final_answer = ai_text
 
         if route == "ai" and (ai_error or not ai_text.strip()):
             final_answer = "Unable to get a response from HPE Support Center. Please try again."
