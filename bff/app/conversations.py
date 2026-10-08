@@ -46,6 +46,7 @@ class Conversation(BaseModel):
         "LIVE_SIMULATED", "LIVE_UNCERTAIN", "CLOSED",
     ] = "AI_ACTIVE"
     interruptId: UUID | None = None
+    pendingToolName: str | None = None
     message: str = ""
     messages: list[Message] = Field(default_factory=list)
     user_context: dict[str, str] = Field(default_factory=dict)

@@ -3,14 +3,16 @@ import { Box, Button } from "grommet";
 import { Copy, Dislike, Like, Robot, User } from "grommet-icons";
 import type { ChatMessage } from "../types";
 import { renderMessageContent } from "../lib/markdown";
+import { DynamicToolUI, type UiSpec } from "../lib/toolUi";
 
 interface ChatMessagesProps {
   messages: ChatMessage[];
   isRunning: boolean;
   messagesEndRef: RefObject<HTMLDivElement | null>;
+  onToolCallRespond: (messageId: string, toolCallId: string, result: unknown) => void;
 }
 
-export function ChatMessages({ messages, isRunning, messagesEndRef }: ChatMessagesProps) {
+export function ChatMessages({ messages, isRunning, messagesEndRef, onToolCallRespond }: ChatMessagesProps) {
   if (!messages.length) return null;
 
   return (
@@ -32,6 +34,14 @@ export function ChatMessages({ messages, isRunning, messagesEndRef }: ChatMessag
             <Box className={`chat-bubble ${m.role}`}>
               {m.content ? renderMessageContent(m.content) : isRunning && m.role === "assistant" ? "..." : ""}
             </Box>
+            {m.pendingToolCall && !m.pendingToolCall.resolved && !!m.pendingToolCall.args?.ui && (
+              <Box margin={{ top: "small", left: "xsmall" }}>
+                <DynamicToolUI
+                  ui={m.pendingToolCall.args.ui as UiSpec}
+                  onRespond={(result) => onToolCallRespond(m.id, m.pendingToolCall!.id, result)}
+                />
+              </Box>
+            )}
             {m.role === "assistant" && !!m.content && (
               <Box direction="row" gap="xsmall" margin={{ top: "small", left: "xsmall" }}>
                 <Button plain hoverIndicator="background" pad="xsmall" icon={<Like size="small" color="text-weak" />} />

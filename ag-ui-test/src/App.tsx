@@ -29,7 +29,12 @@ function App() {
               Try our Beta Troubleshooting and, if needed, we can escalate you to a live agent.
             </Text>
 
-            <ChatMessages messages={chat.messages} isRunning={chat.isRunning} messagesEndRef={chat.messagesEndRef} />
+            <ChatMessages
+              messages={chat.messages}
+              isRunning={chat.isRunning}
+              messagesEndRef={chat.messagesEndRef}
+              onToolCallRespond={chat.respondToToolCall}
+            />
 
             <ChatInput
               input={chat.input}
